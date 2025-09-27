@@ -1,393 +1,10 @@
-# # PIG/diffusion/train_deepprompt.py
-# # -*- coding: utf-8 -*-
-# """
-# Deep Prompt Token batch training with cached VAE latents. (DDP 버전)
-# - 입력: preprocessing.latents.py가 만든 index.jsonl (user_id, item_id, latent_path, prompt)
-# - 유저 임베딩: PIG/embedding/user/user_pref_embs_all.npy (+ _users.json)
-# - 텍스트 임베딩 사전 캐싱 없음: 배치마다 tokenizer + text_encoder 호출
-# - 학습 대상: gθ(DeepPromptHyperNet) + (옵션) Proj_u2txt
-# - 동결: SD v1.5의 VAE/UNet/TextEncoder
-# - 멀티GPU: torch.distributed + DistributedDataParallel (각 GPU 1프로세스)
-
-# 실행 예:
-# torchrun --nproc_per_node=4 -m diffusion.train_deepprompt \
-#   --index ./embedding/vae/index.jsonl \
-#   --user_emb_npy ./embedding/user/user_pref_embs_all.npy \
-#   --user_emb_json ./embedding/user/user_pref_embs_all_users.json \
-#   --batch 1 --grad_accum 8 --epochs 5 --lr 1e-4 --K 8 --train_proj \
-#   --xformers --grad_checkpoint --num_workers 8
-# """
-
-# import argparse, json, os, random
-# from contextlib import nullcontext, ExitStack
-# from pathlib import Path
-
-# import numpy as np
-# import torch
-# import torch.nn as nn
-# import torch.distributed as dist
-# import logging
-# from torch.nn.parallel import DistributedDataParallel as DDP
-# from torch.utils.data import Dataset, DataLoader, DistributedSampler
-# from torch.cuda.amp import GradScaler  # <-- autocast는 호환 헬퍼 사용
-# from tqdm import tqdm
-# from diffusers import StableDiffusionPipeline, DDPMScheduler
-# from transformers import CLIPTokenizer, CLIPTextModel
-
-# from .paths import ROOT, CHECKPOINT_DIR, LOG_DIR
-# from .utils import setup_logger, load_or_init_proj
-# from .hypernet import DeepPromptHyperNet
-
-# # ---------------- DDP helpers ----------------
-# def setup_distributed():
-#     """torchrun을 통한 분산 환경 초기화"""
-#     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-#         rank = int(os.environ["RANK"])
-#         world_size = int(os.environ["WORLD_SIZE"])
-#         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-#         dist.init_process_group(backend="nccl", init_method="env://")
-#         torch.cuda.set_device(local_rank)
-#         return True, rank, world_size, local_rank
-#     else:
-#         return False, 0, 1, 0
-
-# def cleanup_distributed():
-#     if dist.is_available() and dist.is_initialized():
-#         dist.destroy_process_group()
-
-# def is_main_process(rank:int):
-#     return rank == 0
-
-# # ---------------- autocast 호환 헬퍼 ----------------
-# def autocast_ctx(enabled: bool):
-#     if hasattr(torch, "autocast"):
-#         return torch.autocast("cuda", enabled=enabled)
-#     else:
-#         return torch.cuda.amp.autocast(enabled=enabled)
-
-# # ---------------- Dataset ----------------
-# class LatentDataset(Dataset):
-#     """
-#     index.jsonl의 각 줄:
-#     {"user_id": 123, "item_id": 456, "latent_path": "embedding/vae/user123/movie456.pt", "prompt": "a movie poster"}
-#     """
-#     def __init__(self, index_jsonl: str, allowed_uids=None, logger=None):
-#         text = Path(index_jsonl).read_text().strip()
-#         rows = [json.loads(l) for l in text.splitlines()] if text else []
-#         total = len(rows)
-#         if allowed_uids is not None:
-#             rows = [r for r in rows if int(r["user_id"]) in allowed_uids]
-#         self.rows = rows
-#         self.root = ROOT
-
-#         if logger is not None:
-#             logger.info(
-#                 f"Dataset loaded: total={total}, kept={len(self.rows)}, filtered_out={total - len(self.rows)}"
-#             )
-
-#     def __len__(self):
-#         return len(self.rows)
-
-#     def __getitem__(self, idx):
-#         ex = self.rows[idx]
-#         uid = int(ex["user_id"])
-#         mid = int(ex["item_id"])
-#         prompt = ex.get("prompt", "a movie poster")
-#         lat_path = self.root / ex["latent_path"]
-#         obj = torch.load(lat_path, map_location="cpu")
-#         lat = obj["latent"]  # [4,64,64], float16/float32
-#         return {
-#             "user_id": uid,
-#             "item_id": mid,
-#             "latent": lat,
-#             "prompt": prompt
-#         }
-
-# def collate_fn(batch):
-#     uids = torch.tensor([b["user_id"] for b in batch], dtype=torch.long)
-#     mids = torch.tensor([b["item_id"] for b in batch], dtype=torch.long)
-#     lats = torch.stack([b["latent"] for b in batch], dim=0)  # [B,4,64,64]
-#     lats = lats.contiguous(memory_format=torch.channels_last)
-#     prompts = [b["prompt"] for b in batch]
-#     return {"user_id": uids, "item_id": mids, "latent": lats, "prompts": prompts}
-
-# # ---------------- utils ----------------
-# def load_all_user_embeddings(user_emb_npy: Path, user_emb_json: Path):
-#     embs = np.load(user_emb_npy)  # [U, D]
-#     meta = json.loads(user_emb_json.read_text())
-#     users = [int(u) for u in meta["users"]]
-#     if embs.shape[0] != len(users):
-#         raise ValueError(f"Row mismatch: npy={embs.shape[0]} vs users={len(users)}")
-#     uid2idx = {u:i for i,u in enumerate(users)}
-#     return embs, uid2idx
-
-# def seed_everything(seed: int):
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     torch.cuda.manual_seed_all(seed)
-
-# # ---------------- main ----------------
-# def main():
-#     ap = argparse.ArgumentParser()
-#     ap.add_argument("--index", type=str, default=str(ROOT / "embedding" / "vae" / "index.jsonl"))
-#     ap.add_argument("--user_emb_npy", type=str, default=str(ROOT / "embedding" / "user" / "user_pref_embs_all.npy"))
-#     ap.add_argument("--user_emb_json", type=str, default=str(ROOT / "embedding" / "user" / "user_pref_embs_all_users.json"))
-#     ap.add_argument("--batch", type=int, default=1, help="GPU당 배치 크기 (DDP 기준)")
-#     ap.add_argument("--grad_accum", type=int, default=8, help="gradient accumulation steps")
-#     ap.add_argument("--epochs", type=int, default=5)
-#     ap.add_argument("--lr", type=float, default=1e-4)
-#     ap.add_argument("--K", type=int, default=8)
-#     ap.add_argument("--train_proj", action="store_true")
-#     ap.add_argument("--num_workers", type=int, default=8)
-#     ap.add_argument("--seed", type=int, default=42)
-#     ap.add_argument("--log_every", type=int, default=50)
-#     ap.add_argument("--save_every_steps", type=int, default=2000)
-#     ap.add_argument("--xformers", action="store_true")
-#     ap.add_argument("--grad_checkpoint", action="store_true")
-#     args = ap.parse_args()
-
-#     # DDP setup
-#     distributed, rank, world_size, local_rank = setup_distributed()
-#     is_main = is_main_process(rank)
-
-#     # paths
-#     if is_main:
-#         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-#         LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-#     # seed (rank offset)
-#     seed_everything(args.seed + rank)
-
-#     # device/dtype
-#     if torch.cuda.is_available():
-#         torch.cuda.set_device(local_rank if distributed else 0)
-#     device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
-#     use_fp16 = torch.cuda.is_available()
-#     dtype = torch.float16 if use_fp16 else torch.float32
-
-#     # logger (rank0만 파일로그, 나머지는 조용한 logger)
-#     if is_main:
-#         # utils.setup_logger는 filename만 받으면 내부에서 LOG_DIR/filename로 FileHandler를 만듭니다.
-#         logger = setup_logger(f"train_batch_r{rank}", f"train_batch_rank{rank}.log")
-#     else:
-#         logger = logging.getLogger(f"train_batch_r{rank}")
-#         if not logger.handlers:
-#             logger.addHandler(logging.NullHandler())  # 파일 핸들러 없이 조용하게
-#         logger.propagate = False
-#         logger.setLevel(logging.WARNING)
-
-#     # 1) user embeddings
-#     embs_np, uid2idx = load_all_user_embeddings(Path(args.user_emb_npy), Path(args.user_emb_json))
-#     embs = torch.from_numpy(embs_np).float().to(device)  # [U, D]
-#     allowed_uids = set(uid2idx.keys())
-#     if is_main:
-#         logger.info(f"Loaded user embeddings: {embs.shape} | allowed_uids={len(allowed_uids)}")
-
-#     # 2) dataset/loader (DistributedSampler)
-#     #   drop_last=True 로 각 rank의 스텝 수를 동일하게 맞춤(균등 분배).
-#     ds = LatentDataset(args.index, allowed_uids=allowed_uids, logger=logger if is_main else None)
-#     if len(ds) == 0:
-#         if is_main:
-#             logger.error("No training samples found in index.jsonl after filtering with allowed_uids")
-#         cleanup_distributed()
-#         return
-
-#     if distributed:
-#         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
-#         shuffle = False
-#     else:
-#         sampler = None
-#         shuffle = True
-
-#     dl = DataLoader(
-#         ds,
-#         batch_size=args.batch,
-#         shuffle=shuffle,
-#         sampler=sampler,
-#         num_workers=args.num_workers,
-#         pin_memory=True,
-#         persistent_workers=True if args.num_workers > 0 else False,
-#         prefetch_factor=2 if args.num_workers > 0 else None,
-#         collate_fn=collate_fn,
-#         drop_last=True if distributed else False,
-#     )
-#     if is_main:
-#         logger.info(f"Dataset size={len(ds)} | per-GPU batch={args.batch} | workers={args.num_workers}")
-
-#     # 3) pipeline (각 프로세스의 개별 GPU에 로드)
-#     pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=dtype)
-#     if args.xformers:
-#         try:
-#             pipe.enable_xformers_memory_efficient_attention()
-#             if is_main: logger.info("Enabled xFormers memory efficient attention.")
-#         except Exception as e:
-#             if is_main: logger.warning(f"xFormers not available: {e}")
-#     try:
-#         pipe.enable_attention_slicing("max")
-#     except Exception:
-#         pass
-
-#     pipe = pipe.to(device)
-#     vae = pipe.vae
-#     text_encoder: CLIPTextModel = pipe.text_encoder
-#     tokenizer: CLIPTokenizer = pipe.tokenizer
-#     unet = pipe.unet
-#     scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
-
-#     if args.grad_checkpoint:
-#         try:
-#             unet.enable_gradient_checkpointing()
-#             if is_main: logger.info("Enabled UNet gradient checkpointing.")
-#         except Exception as e:
-#             if is_main: logger.warning(f"Grad checkpoint not enabled: {e}")
-
-#     # 고정
-#     for m in [vae, text_encoder, unet]:
-#         for p in m.parameters(): p.requires_grad = False
-#     vae.eval(); text_encoder.eval(); unet.eval()
-
-#     # 4) 학습 모듈 준비 (DDP 래핑)
-#     in_dim = embs.shape[1]
-#     out_dim = text_encoder.config.hidden_size  # 768
-
-#     proj = load_or_init_proj(device=device, in_dim=in_dim, out_dim=out_dim).to(device)
-#     hyper = DeepPromptHyperNet(in_dim=in_dim, out_dim=out_dim, K=args.K, hidden=512, dropout=0.0).to(device)
-
-#     # DDP로 래핑 (find_unused_parameters=False 권장)
-#     if distributed:
-#         hyper = DDP(hyper, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
-#         if args.train_proj:
-#             proj = DDP(proj, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
-
-#     params = list(hyper.parameters())
-#     if args.train_proj:
-#         params += list(proj.parameters())
-#     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-2)
-#     scaler = GradScaler(enabled=use_fp16)
-
-#     # ddp 모델 리스트 (no_sync용)
-#     ddp_models = []
-#     if distributed:
-#         ddp_models.append(hyper)
-#         if args.train_proj:
-#             ddp_models.append(proj)
-
-#     # 5) train loop
-#     step = 0
-#     for ep in range(1, args.epochs + 1):
-#         if distributed:
-#             sampler.set_epoch(ep)
-
-#         running = 0.0
-#         optimizer.zero_grad(set_to_none=True)
-
-#         # tqdm은 rank0만
-#         data_iter = tqdm(dl, desc=f"Epoch {ep} [r{rank}]", disable=not is_main)
-#         for it, batch in enumerate(data_iter, start=1):
-#             # 유저 임베딩 수집
-#             uids_list = batch["user_id"].tolist()
-#             u_batch = torch.stack([embs[uid2idx[int(u)]] for u in uids_list], dim=0).to(device)  # [B,in_dim]
-#             u_batch = u_batch / (u_batch.norm(p=2, dim=-1, keepdim=True) + 1e-8)
-
-#             # noise 준비
-#             latents = batch["latent"].to(device).to(dtype)
-#             B = latents.size(0)
-#             t = torch.randint(0, scheduler.config.num_train_timesteps, (B,), device=device).long()
-#             noise = torch.randn_like(latents)
-#             noisy = scheduler.add_noise(latents, noise, t)
-
-#             # 텍스트 인코딩
-#             text_inputs = tokenizer(
-#                 batch["prompts"],
-#                 padding="max_length",
-#                 max_length=tokenizer.model_max_length,
-#                 truncation=True,
-#                 return_tensors="pt"
-#             ).to(device)
-
-#             with torch.no_grad():
-#                 with autocast_ctx(use_fp16):
-#                     base_embeds = text_encoder(input_ids=text_inputs.input_ids)[0]  # [B, T, 768]
-
-#             # grad accumulation 동안 통신 억제 (no_sync)
-#             use_no_sync = distributed and ((it % args.grad_accum) != 0)
-#             sync_ctx = ExitStack()
-#             if use_no_sync and len(ddp_models) > 0:
-#                 for m in ddp_models:
-#                     sync_ctx.enter_context(m.no_sync())
-#             else:
-#                 sync_ctx.enter_context(nullcontext())
-
-#             with sync_ctx:
-#                 with autocast_ctx(use_fp16):
-#                     e_user = proj(u_batch).unsqueeze(1).to(base_embeds.dtype) if args.train_proj else \
-#                              u_batch.new_zeros((u_batch.size(0),1,out_dim), dtype=base_embeds.dtype)
-#                     dp_tokens = hyper(u_batch).to(base_embeds.dtype)  # [B, K, 768]
-#                     cond = torch.cat([dp_tokens, base_embeds, e_user], dim=1)  # [B, K+T+1, 768]
-
-#                     pred = unet(noisy, t, encoder_hidden_states=cond).sample
-#                     loss = ((pred - noise) ** 2).mean()
-
-#                 loss_to_bp = loss / max(1, args.grad_accum)
-#                 scaler.scale(loss_to_bp).backward()
-
-#             running += float(loss.item())
-#             step += 1
-
-#             # 스텝/업데이트
-#             if (it % args.grad_accum == 0):
-#                 scaler.step(optimizer); scaler.update()
-#                 optimizer.zero_grad(set_to_none=True)
-
-#             # 로그 (rank0만)
-#             if is_main and (step % args.log_every == 0):
-#                 avg = running / args.log_every
-#                 logger.info(f"[ep {ep} step {step}] loss={loss.item():.4f} avg={avg:.4f} B={B}")
-#                 running = 0.0
-
-#             # 중간 저장 (rank0만)
-#             if is_main and args.save_every_steps > 0 and (step % args.save_every_steps == 0):
-#                 _proj = proj.module if (distributed and isinstance(proj, DDP)) else proj
-#                 _hyper = hyper.module if (distributed and isinstance(hyper, DDP)) else hyper
-#                 torch.save(_hyper.state_dict(), CHECKPOINT_DIR / "dpt_hypernet.pt")
-#                 if args.train_proj:
-#                     torch.save(_proj.state_dict(), CHECKPOINT_DIR / "proj_u2txt_dpt.pt")
-#                 logger.info(f"Saved checkpoint at step {step}")
-
-#         # 에폭 저장 (rank0만)
-#         if is_main:
-#             _proj = proj.module if (distributed and isinstance(proj, DDP)) else proj
-#             _hyper = hyper.module if (distributed and isinstance(hyper, DDP)) else hyper
-#             torch.save(_hyper.state_dict(), CHECKPOINT_DIR / f"dpt_hypernet_ep{ep}.pt")
-#             if args.train_proj:
-#                 torch.save(_proj.state_dict(), CHECKPOINT_DIR / f"proj_u2txt_dpt_ep{ep}.pt")
-#             logger.info(f"[Epoch {ep}] saved checkpoints.")
-
-#         # 모든 프로세스 동기화 (선택)
-#         if distributed:
-#             dist.barrier()
-
-#     if is_main:
-#         logger.info("Training done.")
-#     cleanup_distributed()
-
-# if __name__ == "__main__":
-#     main()
-
-
-# -*- coding: utf-8 -*-
 """
-train_deepprompt.py (최소 변경 + DDP fix)
 
-- 기존 코드 흐름을 유지하면서 다음만 옵션으로 추가/수정
   * 손실 옵션: mse / clip / contrastive / mse+clip / mse+contrastive
   * 전역 DPT 사용 여부: --dpt_mode [hyper|global] (기본 hyper = 기존 동작)
   * Mid/Up 위주 삽입(마스킹): --enable_mid, --enable_up_from, (선택) --enable_down
   * DDP fix: user_ctr_head를 분산 시 DDP로 래핑, .no_sync() 호출 대상 필터링
-  * GradScaler 경고 제거(torch.cuda.amp → torch.amp)
 
-주의: .paths/.utils/.hypernet 모듈은 기존 프로젝트 구조를 그대로 사용합니다.
 """
 
 import argparse, json, os, random, logging
@@ -407,12 +24,11 @@ from tqdm import tqdm
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPModel
 
-# === 기존 유틸/경로/하이퍼넷 유지 ===
 from .paths import ROOT, CHECKPOINT_DIR, LOG_DIR
 from .utils import setup_logger, load_or_init_proj
 from .hypernet import DeepPromptHyperNet
 
-# ---------------- DDP helpers (원본 유지) ----------------
+# ---------------- DDP helpers ----------------
 def setup_distributed():
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"]) ; world_size = int(os.environ["WORLD_SIZE"]) ; local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -429,14 +45,14 @@ def cleanup_distributed():
 def is_main_process(rank:int):
     return rank == 0
 
-# ---------------- autocast 호환 (원본 유지) ----------------
+# ---------------- autocast 호환 ----------------
 def autocast_ctx(enabled: bool):
     if hasattr(torch, "autocast"):
         return torch.autocast("cuda", enabled=enabled)
     else:
         return torch.cuda.amp.autocast(enabled=enabled)
 
-# ---------------- Dataset (원본 유지) ----------------
+# ---------------- Dataset ----------------
 class LatentDataset(Dataset):
     def __init__(self, index_jsonl: str, allowed_uids=None, logger=None):
         text = Path(index_jsonl).read_text().strip()
@@ -465,7 +81,7 @@ def collate_fn(batch):
     prompts = [b["prompt"] for b in batch]
     return {"user_id": uids, "item_id": mids, "latent": lats, "prompts": prompts}
 
-# ---------------- Utils (원본 유지 + 소폭 추가) ----------------
+# ---------------- Utils ----------------
 def load_all_user_embeddings(user_emb_npy: Path, user_emb_json: Path):
     embs = np.load(user_emb_npy)  # [U, D]
     meta = json.loads(user_emb_json.read_text())
@@ -481,7 +97,7 @@ def seed_everything(seed: int):
 def normalize(x, eps=1e-8):
     return x / (x.norm(dim=-1, keepdim=True) + eps)
 
-# ----- 전역 DPT/손실용 보조 (신규 추가, 최소 영향) -----
+# ----- 전역 DPT/손실용 보조 -----
 class GlobalDPT(nn.Module):
     def __init__(self, K: int, hidden: int):
         super().__init__()
@@ -558,7 +174,7 @@ except Exception:
     def attach_masking_processors(*args, **kwargs):
         pass
 
-# ---------------- main (원본 구조 최대 유지) ----------------
+# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", type=str, default=str(ROOT / "embedding" / "vae" / "index.jsonl"))
@@ -576,7 +192,6 @@ def main():
     ap.add_argument("--save_every_steps", type=int, default=2000)
     ap.add_argument("--xformers", action="store_true")
     ap.add_argument("--grad_checkpoint", action="store_true")
-    # 신규 옵션
     ap.add_argument("--dpt_mode", type=str, default="hyper", choices=["hyper","global"], help="전역 DPT 사용 여부")
     ap.add_argument("--loss_mode", type=str, default="mse", choices=["mse","clip","contrastive","mse+clip","mse+contrastive"])
     ap.add_argument("--lambda_personal", type=float, default=0.5)
@@ -659,7 +274,7 @@ def main():
         for p in m.parameters(): p.requires_grad = False
     vae.eval(); text_encoder.eval(); unet.eval()
 
-    # 학습 모듈 준비 (원본 유지 + 전역 DPT 옵션)
+    # 학습 모듈 준비
     in_dim = embs.shape[1]
     out_dim = text_encoder.config.hidden_size
 
@@ -682,7 +297,7 @@ def main():
     else:
         user_ctr_head = None
 
-    # Optimizer & DDP 래핑 (필요한 것만)
+    # Optimizer & DDP 래핑
     params = []
     if hyper is not None: params += list(hyper.parameters())
     if dpt_global is not None: params += list(dpt_global.parameters())
@@ -702,7 +317,7 @@ def main():
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-2)
     scaler = GradScaler("cuda", enabled=use_fp16)
 
-    # attn 주입 레이어 제어 (옵션, 기본은 원본과 동일하게 전층 사용)
+    # attn 주입 레이어 제어
     if (args.enable_down or args.enable_mid or args.enable_up_from is not None) and ('tokenizer' in locals()) and (tokenizer is not None) and (AttnProcessor2_0 is not None):
         T = tokenizer.model_max_length
         enable_mid = True if args.enable_mid else True  # Mid는 기본 허용 권장
@@ -716,7 +331,7 @@ def main():
             if m is not None and hasattr(m, "no_sync"):
                 ddp_models.append(m)
 
-    # 학습 루프 (원본 흐름 유지)
+    # 학습 루프
     step = 0
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
@@ -752,7 +367,7 @@ def main():
 
             with sync_ctx:
                 with autocast_ctx(use_fp16):
-                    # e_user 토큰 (원본 유지)
+                    # e_user 토큰
                     if args.train_proj:
                         e_user = (proj.module if isinstance(proj, DDP) else proj)(u_batch).unsqueeze(1).to(base_embeds.dtype)
                     else:
@@ -761,10 +376,10 @@ def main():
                     # DPT 토큰
                     if hyper is not None:
                         hyper_call = hyper.module if isinstance(hyper, DDP) else hyper
-                        dp_tokens = hyper_call(u_batch).to(base_embeds.dtype)  # 기존 경로
+                        dp_tokens = hyper_call(u_batch).to(base_embeds.dtype)
                     else:
                         dpt_call = dpt_global.module if isinstance(dpt_global, DDP) else dpt_global
-                        dp_tokens = dpt_call(B).to(base_embeds.dtype)   # 전역 DPT 경로
+                        dp_tokens = dpt_call(B).to(base_embeds.dtype)
 
                     cond = torch.cat([dp_tokens, base_embeds, e_user], dim=1)  # [B, K+T+1, H]
 
