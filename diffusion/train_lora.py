@@ -1,5 +1,3 @@
-# PIG/diffusion/train_lora.py
-# -*- coding: utf-8 -*-
 """
 PEFT-LoRA fine-tuning with cached VAE latents. (DDP 버전)
 - 입력: preprocessing.latents.py가 만든 index.jsonl (user_id, item_id, latent_path, prompt)
@@ -161,7 +159,7 @@ def add_peft_lora_to_unet(unet, r, alpha, dropout, device, dtype, logger=None):
     # 4) 디바이스/정밀도 정렬 (본체 FP16로 줄이기)
     unet.to(device, dtype=dtype)
 
-    # 5) 🔑 학습 대상(LoRA)만 FP32로 되돌리기
+    # 5) 학습 대상(LoRA)만 FP32로 되돌리기
     for p in unet.parameters():
         if p.requires_grad:
             p.data = p.data.float()     # FP32
