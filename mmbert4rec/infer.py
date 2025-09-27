@@ -1,5 +1,3 @@
-# PIG/mmbert4rec/export_all_user_embs.py
-# -*- coding: utf-8 -*-
 """
 모든 유저 선호도 임베딩 추출 스크립트
 - 주어진 학습 체크포인트를 로드
@@ -89,7 +87,6 @@ def main():
     ap.add_argument("--img_path",  type=str, default=str(DEFAULT_IMG))
     ap.add_argument("--max_len", type=int, default=50)
     ap.add_argument("--batch",   type=int, default=256)
-    # 학습 당시 설정 추정/재현 (hidden은 ckpt에 저장되어 있음, 나머지는 기본값과 동일했을 가능성 큼)
     ap.add_argument("--heads",  type=int, default=4)
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--fusion", type=str, default="concat", choices=["concat","wsum","gate"])
