@@ -37,7 +37,7 @@ PIG/
 ├─ data/
 │  ├─ raw/
 │  │  └─ ml-latest/                # MovieLens original files (user-provided)
-│  └─ preprocessed/                # RecBole atomic format (.inter / .item)
+│  └─ preprocessed/                # atomic format (.inter / .item)
 ├─ diffusion/
 │  ├─ train_deepprompt.py          # DPT training (HyperNet + optional proj_u2txt, user_ctr_head)
 │  ├─ train_lora.py                # LoRA training
@@ -57,7 +57,7 @@ PIG/
 │  ├─ run.py                       # Entry point for training
 │  └─ infer.py                     # Export user embeddings
 ├─ preprocessing/
-│  ├─ mllatest_preprocess.py       # MovieLens → RecBole atomic (.inter/.item)
+│  ├─ mllatest_preprocess.py       # MovieLens → atomic (.inter/.item)
 │  ├─ clip_mllatest.py             # CLIP text/poster embedding cache
 │  └─ latents.py                   # (Optional) VAE latent extraction
 └─ log/
