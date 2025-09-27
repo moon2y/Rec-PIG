@@ -96,6 +96,7 @@ pip install xformers   # optional
      - movies.csv
      ...
    ```
+   Also download **Kaggle movies_metadata.csv** and place it in the same directory
 
 2. Convert to **RecBole atomic** format:
    ```bash
