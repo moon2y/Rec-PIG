@@ -1,6 +1,6 @@
-# PIG: Recsys‑Conditioned Personalized Image Generation
+# Rec-PIG: Recsys‑Conditioned Personalized Image Generation
 
-> **PIG** is a research codebase that fuses user preference embeddings from a recommender system with **Stable Diffusion v1.5** to generate **personalized images**.  
+> **Rec-PIG** is a research codebase that fuses user preference embeddings from a recommender system with **Stable Diffusion v1.5** to generate **personalized images**.  
 > Pipeline: **Sequence recommendation (multi‑modal BERT4Rec‑style)** → **User embedding extraction** → **Personalization via Deep Prompt Tokens (HyperNet) or LoRA** → **Text/Img2Img generation**.
 
 ---
