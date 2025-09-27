@@ -21,7 +21,7 @@
 ---
 
 ## Key Features
-- **End‑to‑end pipeline** from MovieLens preprocessing → multi‑modal sequence model → user embedding export → **personalized** Stable Diffusion.
+- **End‑to‑end pipeline**: MovieLens preprocessing → multi‑modal sequence model → user embedding export → **personalized** Stable Diffusion.
 - **Deep Prompt HyperNet (DPT)**: generate **K dynamic tokens** from user embeddings and inject them into the text encoder.
 - **LoRA** option for lightweight personalization.
 - **Img2Img & Text‑only** modes, CFG‑safe negative prompt embedding alignment.
