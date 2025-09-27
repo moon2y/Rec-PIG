@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import argparse
 from pathlib import Path
 import logging
@@ -72,7 +71,7 @@ def main(args):
         max_len=args.max_len, fusion=args.fusion
     ).to(device)
 
-    # ✅ 가용 GPU 자동 탐지 + 워밍업
+    # 가용 GPU 자동 탐지 + 워밍업
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         device_ids = list(range(torch.cuda.device_count()))
         logger.info(f"Using {len(device_ids)} GPUs with DataParallel {device_ids}")
@@ -89,7 +88,7 @@ def main(args):
 
     for epoch in range(1, args.epochs + 1):
         logger.info(f"=== Epoch {epoch}/{args.epochs} ===")
-        # ✅ non_blocking=True 로 전송 최적화 (trainer 내부에서 seq.to 호출할 때 사용)
+        # non_blocking=True 로 전송 최적화 (trainer 내부에서 seq.to 호출할 때 사용)
         loss = train_epoch(model, train_loader, opt, device)
         hit, ndcg, mrr = evaluate(model, valid_loader, device, K_eval=args.k, num_negs=args.eval_negs)
         logger.info(f"[Epoch {epoch:03d}] TrainLoss={loss:.6f}  Valid@{args.k}  Hit={hit:.6f}  NDCG={ndcg:.6f}  MRR={mrr:.6f}")
