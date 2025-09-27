@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Deep Prompt Token (DPT) HyperNet gθ: u(256) -> K tokens(768 each)
 We use a small MLP with LayerNorm; K tokens are produced per user and
